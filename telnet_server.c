@@ -2,11 +2,15 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <string.h>
+#include <errno.h>
+#include <signal.h>
 #include <arpa/inet.h>
-#include <pthread.h>
+#include <sys/select.h>
 
-#define MAX_CLIENTS 10
+#define MAX_CLIENT 10
 #define BUFFER_SIZE 1024
 #define MAX_USERNAME_LEN 32
 #define MAX_PASSWORD_LEN 32
@@ -19,14 +23,110 @@ typedef struct client
     char password[MAX_PASSWORD_LEN];
 } client_t;
 
-client_t clients[MAX_CLIENTS];
-int client_count = 0;
-pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
-struct sockaddr_in server_addr;
+int authenticate_user(char *username, char *password)
+{
+    FILE *fp = fopen("account.txt", "r");
+    if (fp == NULL)
+    {
+        perror("fopen() failed");
+        return -1;
+    }
 
-int authenticate_user(char *, char *);
-int handle_command(int, char *);
-void *client_proc(void *);
+    // Tạo buffer để đọc từ file
+    char buf[MAX_USERNAME_LEN + MAX_PASSWORD_LEN + 2];
+    memset(buf, 0, sizeof(buf));
+
+    // Đọc từng dòng trong file
+    while (fgets(buf, sizeof(buf), fp) != NULL)
+    {
+        // Xóa ký tự xuống dòng
+        buf[strcspn(buf, "\n")] = 0;
+
+        // Tách username và password
+        char stored_username[MAX_USERNAME_LEN];
+        char stored_password[MAX_PASSWORD_LEN];
+        sscanf(buf, "%s %s", stored_username, stored_password);
+
+        // Kiểm tra username và password
+        if (strcmp(username, stored_username) == 0 && strcmp(password, stored_password) == 0)
+        {
+            return 1;
+        }
+    }
+
+    fclose(fp);
+
+    return 0;
+}
+
+void handle_command(int sockfd, char *command)
+{
+    char cmd[BUFFER_SIZE];
+    sprintf(cmd, "%s > out.txt", command);
+
+    // Thực thi lệnh
+    int status = system(cmd);
+    if (status == 0)
+    {
+        // Mở file out.txt
+        FILE *fp = fopen("out.txt", "r");
+        if (fp == NULL)
+        {
+            perror("fopen() failed");
+            return;
+        }
+
+        // Tạo buffer để đọc từ file
+        char buf[BUFFER_SIZE];
+        memset(buf, 0, sizeof(buf));
+
+        // Đọc từng dòng trong file
+        while (fgets(buf, sizeof(buf), fp) != NULL)
+        {
+            // Gửi dữ liệu về client
+            if (send(sockfd, buf, strlen(buf), 0) == -1)
+            {
+                perror("send() failed");
+                return;
+            }
+        }
+
+        // Yêu cầu client nhập lệnh tiếp theo
+        char *msg = "Enter command: ";
+        if (send(sockfd, msg, strlen(msg), 0) == -1)
+        {
+            perror("send() failed");
+            return;
+        }
+
+        // Đóng file
+        fclose(fp);
+
+        // Xóa file
+        remove("out.txt");
+    }
+    else
+    {
+        // Gửi thông báo lỗi về client
+        char *msg = "Invalid command!\nEnter another command: ";
+        if (send(sockfd, msg, strlen(msg), 0) == -1)
+        {
+            perror("send() failed");
+            return;
+        }
+    }
+}
+
+void signalHandler()
+{
+    int stat;
+    int pid = wait(&stat);
+    if (pid > 0)
+    {
+        printf("Child %d terminated with exit status %d\n", pid, stat);
+    }
+    return;
+}
 
 int main(int argc, char *argv[])
 {
@@ -38,8 +138,9 @@ int main(int argc, char *argv[])
     }
 
     // Thiết lập thông tin địa chỉ cho socket
+    struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
+    server_addr.sin_family = AF_INET; // IPv4
     server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
     server_addr.sin_port = htons(atoi(argv[1]));
 
@@ -59,19 +160,21 @@ int main(int argc, char *argv[])
     }
 
     // Chuyển socket sang trạng thái lắng nghe
-    if (listen(server, MAX_CLIENTS) < 0)
+    if (listen(server, MAX_CLIENT) < 0)
     {
         perror("listen() failed");
         exit(EXIT_FAILURE);
     }
 
-    printf("Waiting for new client on %s:%d...\n",
-               inet_ntoa(server_addr.sin_addr),
-               ntohs(server_addr.sin_port));
-
+    // Thiết lập signal handler
+    signal(SIGCHLD, signalHandler);
 
     while (1)
     {
+        printf("Waiting for new client on %s:%d\n",
+               inet_ntoa(server_addr.sin_addr),
+               ntohs(server_addr.sin_port));
+
         // Chấp nhận kết nối từ client
         struct sockaddr_in client_addr;
         memset(&client_addr, 0, sizeof(client_addr));
@@ -82,327 +185,153 @@ int main(int argc, char *argv[])
             perror("accept() failed");
             exit(EXIT_FAILURE);
         }
-        if (client_count == MAX_CLIENTS)
-        {
-            char *msg = "Server is full!\nPlease try again later.\n";
-            if (send(client, msg, strlen(msg), 0) < 0)
-            {
-                perror("send() failed");
-            }
-            close(client);
-            continue;
-        }
-        printf("Client from %s:%d connected\n",
+
+        printf("New client connected from %s:%d\n",
                inet_ntoa(client_addr.sin_addr),
                ntohs(client_addr.sin_port));
 
-        pthread_mutex_lock(&clients_mutex);
-        clients[client_count].sockfd = client;
-        clients[client_count].addr = client_addr;
-        strcpy(clients[client_count].username, "");
-        strcpy(clients[client_count].password, "");
-        client_count++;
-        pthread_mutex_unlock(&clients_mutex);
+        // Tạo process con để xử lý client
+        if (fork() == 0)
+        {
+            // Đóng server socket
+            close(server);
 
-        // Tạo thread để xử lý client
-        pthread_t thread_id;
-        pthread_create(&thread_id, NULL, client_proc, (void *)&clients[client_count - 1]);
-        pthread_detach(thread_id);
+            // Khởi tạo thông tin client
+            client_t client_info;
+            memset(&client_info, 0, sizeof(client_info));
+            client_info.sockfd = client;
+            client_info.addr = client_addr;
+            strcpy(client_info.username, "");
+            strcpy(client_info.password, "");
+
+            // Gửi thông báo yêu cầu nhập username và password
+            char *msg = "Enter your \"username password\": ";
+            if (send(client, msg, strlen(msg), 0) < 0)
+            {
+                perror("send() failed");
+                continue;
+            }
+
+            // Tạo buffer để nhận dữ liệu từ client
+            char buf[BUFFER_SIZE];
+
+            // Xử lý yêu cầu của client
+            while (1)
+            {
+                // Reset buffer
+                memset(buf, 0, sizeof(buf));
+
+                // Nhận dữ liệu từ client
+                int bytes_received = recv(client, buf, sizeof(buf), 0);
+                if (bytes_received < 0)
+                {
+                    perror("recv() failed");
+                    break;
+                }
+                else if (bytes_received == 0)
+                {
+                    printf("Client from %s:%d disconnected\n",
+                           inet_ntoa(client_addr.sin_addr),
+                           ntohs(client_addr.sin_port));
+                    break;
+                }
+                else
+                {
+                    // Xóa ký tự xuống dòng ở cuối chuỗi
+                    buf[strcspn(buf, "\n")] = 0;
+
+                    // Kiểm tra xem client đã đăng nhập hay chưa
+                    if (strcmp(client_info.username, "") == 0 && strcmp(client_info.password, "") == 0)
+                    {
+                        char username[MAX_USERNAME_LEN];
+                        char password[MAX_PASSWORD_LEN];
+                        char temp[BUFFER_SIZE];
+                        int ret = sscanf(buf, "%s %s %s", username, password, temp);
+                        if (ret == 2)
+                        {
+                            // Xác thực thông tin đăng nhập
+                            int status = authenticate_user(username, password);
+                            if (status == 1)
+                            {
+                                // Lưu thông tin đăng nhập vào client
+                                strcpy(client_info.username, username);
+                                strcpy(client_info.password, password);
+
+                                // Gửi thông báo đến client
+                                char *msg = "Login successful\nEnter your command: ";
+                                if (send(client, msg, strlen(msg), 0) < 0)
+                                {
+                                    perror("send() failed");
+                                    continue;
+                                }
+                            }
+                            else if (status == 0)
+                            {
+                                // Gửi thông báo đến client
+                                char *msg = "Login failed! Username or Password is incorrect\nPlease enter again your \"username password\": ";
+                                if (send(client, msg, strlen(msg), 0) < 0)
+                                {
+                                    perror("send() failed");
+                                    continue;
+                                }
+                            }
+                            else
+                            {
+                                // Gửi thông báo đến client
+                                char *msg = "Server error\nDatabase file not found!\nPlease enter again your \"username password\": ";
+                                if (send(client, msg, strlen(msg), 0) < 0)
+                                {
+                                    perror("send() failed");
+                                    continue;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // Gửi thông báo đến client
+                            char *msg = "Invalid format!\nPlease enter again your \"username password\": ";
+                            if (send(client, msg, strlen(msg), 0) < 0)
+                            {
+                                perror("send() failed");
+                                continue;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Xử lý lệnh
+                        if (strcmp(buf, "quit") == 0 || strcmp(buf, "exit") == 0)
+                        {
+                            // Gửi thông báo đến client
+                            char *msg = "Goodbye!\n";
+                            if (send(client, msg, strlen(msg), 0) < 0)
+                            {
+                                perror("send() failed");
+                                continue;
+                            }
+                            break;
+                        }
+                        else
+                        {
+                            handle_command(client, buf);
+                        }
+                    }
+                }
+            }
+
+            // Đóng client socket
+            close(client);
+
+            // Thoát process con
+            exit(EXIT_SUCCESS);
+        }
+
+        // Đóng client socket
+        close(client);
     }
 
     // Đóng server socket
     close(server);
 
     return 0;
-}
-
-int authenticate_user(char *username, char *password)
-{
-    // Mở file database.txt
-    FILE *fp = fopen("database.txt", "r");
-    if (fp == NULL)
-    {
-        perror("fopen() failed");
-        return -1; // Lỗi mở file
-    }
-
-    // Tạo buffer để đọc từ file
-    char buf[MAX_USERNAME_LEN + MAX_PASSWORD_LEN + 2];
-    memset(buf, 0, sizeof(buf));
-
-    // Đọc từng dòng trong file
-    while (fgets(buf, sizeof(buf), fp) != NULL)
-    {
-        // Xóa ký tự xuống dòng
-        buf[strcspn(buf, "\n")] = 0;
-
-        // Tách username và password
-        char stored_username[MAX_USERNAME_LEN];
-        char stored_password[MAX_PASSWORD_LEN];
-        sscanf(buf, "%s %s", stored_username, stored_password);
-
-        // So sánh username và password
-        if (strcmp(username, stored_username) == 0 && strcmp(password, stored_password) == 0)
-        {
-            // Đóng file
-            fclose(fp);
-
-            return 1; // Xác thực thành công
-        }
-    }
-
-    // Đóng file
-    fclose(fp);
-
-    return 0; // Xác thực thất bại
-}
-
-int handle_command(int sockfd, char *command)
-{
-    char cmd[BUFFER_SIZE];
-    sprintf(cmd, "%s > out.txt", command);
-
-    // Thực thi lệnh
-    int status = system(cmd);
-    if (status == 0)
-    {
-        // Mở file out.txt
-        FILE *fp = fopen("out.txt", "r");
-        if (fp == NULL)
-        {
-            perror("fopen() failed");
-            return -1;
-        }
-
-        // Tạo buffer để đọc từ file
-        char buf[BUFFER_SIZE];
-        memset(buf, 0, sizeof(buf));
-
-        // Đọc từng dòng trong file
-        while (fgets(buf, sizeof(buf), fp) != NULL)
-        {
-            // Gửi dữ liệu về client
-            if (send(sockfd, buf, strlen(buf), 0) == -1)
-            {
-                perror("send() failed");
-                return -1;
-            }
-        }
-
-        // Đóng file
-        fclose(fp);
-
-        // Xóa file
-        remove("out.txt");
-    }
-    return status;
-}
-
-void *client_proc(void *param)
-{
-    client_t *client_info = (client_t *)param;
-    char buffer[BUFFER_SIZE];
-
-    // Xác thực client
-    while (1)
-    {
-        // Gửi thông báo yêu cầu nhập username và password
-        char *msg = "Enter your \"username password\": ";
-        if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-        {
-            perror("send() failed");
-        }
-
-        // Nhận username và password từ client
-        memset(buffer, 0, sizeof(buffer));
-        int bytes_received = recv(client_info->sockfd, buffer, sizeof(buffer), 0);
-        if (bytes_received < 0)
-        {
-            perror("recv() failed");
-            return NULL;
-        }
-        else if (bytes_received == 0)
-        {
-            printf("Client from %s:%d disconnected\n",
-                   inet_ntoa(client_info->addr.sin_addr),
-                   ntohs(client_info->addr.sin_port));
-            for (int i = 0; i < client_count; i++)
-            {
-                if (client_info->sockfd == clients[i].sockfd)
-                {
-                    pthread_mutex_lock(&clients_mutex);
-                    clients[i] = clients[client_count - 1];
-                    client_count--;
-                    if (client_count == 0)
-                    {
-                        printf("Waiting for clients on %s:%d...\n",
-                               inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port));
-                    }
-                    pthread_mutex_unlock(&clients_mutex);
-                    break;
-                }
-            }
-            return NULL;
-        }
-        else
-        {
-            // Xóa ký tự xuống dòng ở cuối chuỗi
-            buffer[strcspn(buffer, "\n")] = 0;
-
-            // Tách username và password
-            char username[MAX_USERNAME_LEN];
-            char password[MAX_PASSWORD_LEN];
-            char temp[BUFFER_SIZE];
-            int ret = sscanf(buffer, "%s %s %s", username, password, temp);
-            if (ret == 2)
-            {
-                // Xác thực thông tin đăng nhập
-                int status = authenticate_user(username, password);
-                if (status == 1)
-                {
-                    // Lưu thông tin đăng nhập vào client
-                    strcpy(client_info->username, username);
-                    strcpy(client_info->password, password);
-
-                    // Gửi thông báo đến client
-                    char *msg = "Login successful\nReady to execute command!\n";
-                    if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                    {
-                        perror("send() failed");
-                        continue;
-                    }
-                    break;
-                }
-                else if (status == 0)
-                {
-                    // Gửi thông báo đến client
-                    char *msg = "Login failed! Username or Password is incorrect\nPlease try again!\n";
-                    if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                    {
-                        perror("send() failed");
-                        continue;
-                    }
-                    continue;
-                }
-                else
-                {
-                    // Gửi thông báo đến client
-                    char *msg = "Server error\nDatabase file not found!\nPlease try again later!\n";
-                    if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                    {
-                        perror("send() failed");
-                        continue;
-                    }
-                    continue;
-                }
-            }
-            else
-            {
-                // Gửi thông báo đến client
-                char *msg = "Invalid format!\nPlease try again!\n";
-                if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                {
-                    perror("send() failed");
-                    continue;
-                }
-                continue;
-            }
-        }
-    }
-
-    // Xử lý lệnh
-    while (1)
-    {
-        // Yêu cầu client nhập lệnh
-        char *msg = "Enter your command: ";
-        if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-        {
-            perror("send() failed");
-            continue;
-        }
-
-        // Nhận lệnh từ client
-        memset(buffer, 0, sizeof(buffer));
-        int bytes_received = recv(client_info->sockfd, buffer, sizeof(buffer), 0);
-        if (bytes_received < 0)
-        {
-            perror("recv() failed");
-            return NULL;
-        }
-        else if (bytes_received == 0)
-        {
-            printf("Client from %s:%d disconnected\n",
-                   inet_ntoa(client_info->addr.sin_addr),
-                   ntohs(client_info->addr.sin_port));
-            for (int i = 0; i < client_count; i++)
-            {
-                if (client_info->sockfd == clients[i].sockfd)
-                {
-                    pthread_mutex_lock(&clients_mutex);
-                    clients[i] = clients[client_count - 1];
-                    client_count--;
-                    if (client_count == 0)
-                    {
-                        printf("Waiting for clients on %s:%d...\n",
-                               inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port));
-                    }
-                    pthread_mutex_unlock(&clients_mutex);
-                    break;
-                }
-            }
-            break;
-        }
-        else
-        {
-            // Xóa ký tự xuống dòng ở cuối chuỗi
-            buffer[strcspn(buffer, "\n")] = 0;
-
-            if (strcmp(buffer, "quit") == 0 || strcmp(buffer, "exit") == 0)
-            {
-                // Gửi thông báo đến client
-                char *msg = "Goodbye!\n";
-                if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                {
-                    perror("send() failed");
-                    continue;
-                }
-                printf("Client from %s:%d disconnected\n",
-                       inet_ntoa(client_info->addr.sin_addr),
-                       ntohs(client_info->addr.sin_port));
-                for (int i = 0; i < client_count; i++)
-                {
-                    if (client_info->sockfd == clients[i].sockfd)
-                    {
-                        pthread_mutex_lock(&clients_mutex);
-                        clients[i] = clients[client_count - 1];
-                        client_count--;
-                        if (client_count == 0)
-                        {
-                            printf("Waiting for clients on %s:%d...\n",
-                                   inet_ntoa(server_addr.sin_addr), ntohs(server_addr.sin_port));
-                        }
-                        pthread_mutex_unlock(&clients_mutex);
-                        break;
-                    }
-                }
-                break;
-            }
-            else
-            {
-                // Xử lý lệnh
-                if (handle_command(client_info->sockfd, buffer) != 0)
-                {
-                    char *msg = "Invalid command!\nPleas try again!\n";
-                    if (send(client_info->sockfd, msg, strlen(msg), 0) < 0)
-                    {
-                        perror("send() failed");
-                        continue;
-                    }
-                    continue;
-                }
-            }
-        }
-    }
-
-    return NULL;
 }
